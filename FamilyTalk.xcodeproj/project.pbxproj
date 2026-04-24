@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AE688D9B2F9B250D003625D9 /* CLAUDE.md in Resources */ = {isa = PBXBuildFile; fileRef = AE688D9A2F9B2506003625D9 /* CLAUDE.md */; };
+		AE688D9E2F9B35E3003625D9 /* SocketIO in Frameworks */ = {isa = PBXBuildFile; productRef = AE688D9D2F9B35E3003625D9 /* SocketIO */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		AE688D272F9A8C62003625D9 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,6 +32,7 @@
 		AE688D192F9A8C61003625D9 /* FamilyTalk.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FamilyTalk.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AE688D262F9A8C62003625D9 /* FamilyTalkTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FamilyTalkTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AE688D302F9A8C62003625D9 /* FamilyTalkUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FamilyTalkUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AE688D9A2F9B2506003625D9 /* CLAUDE.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CLAUDE.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +58,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AE688D9E2F9B35E3003625D9 /* SocketIO in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -75,6 +82,7 @@
 		AE688D102F9A8C61003625D9 = {
 			isa = PBXGroup;
 			children = (
+				AE688D9A2F9B2506003625D9 /* CLAUDE.md */,
 				AE688D1B2F9A8C61003625D9 /* FamilyTalk */,
 				AE688D292F9A8C62003625D9 /* FamilyTalkTests */,
 				AE688D332F9A8C62003625D9 /* FamilyTalkUITests */,
@@ -112,6 +120,7 @@
 			);
 			name = FamilyTalk;
 			packageProductDependencies = (
+				AE688D9D2F9B35E3003625D9 /* SocketIO */,
 			);
 			productName = FamilyTalk;
 			productReference = AE688D192F9A8C61003625D9 /* FamilyTalk.app */;
@@ -195,6 +204,9 @@
 			);
 			mainGroup = AE688D102F9A8C61003625D9;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				AE688D9C2F9B3534003625D9 /* XCRemoteSwiftPackageReference "socket" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AE688D1A2F9A8C61003625D9 /* Products */;
 			projectDirPath = "";
@@ -212,6 +224,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AE688D9B2F9B250D003625D9 /* CLAUDE.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -578,6 +591,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		AE688D9C2F9B3534003625D9 /* XCRemoteSwiftPackageReference "socket" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/socketio/socket.io-client-swift";
+			requirement = {
+				branch = master;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AE688D9D2F9B35E3003625D9 /* SocketIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AE688D9C2F9B3534003625D9 /* XCRemoteSwiftPackageReference "socket" */;
+			productName = SocketIO;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = AE688D112F9A8C61003625D9 /* Project object */;
 }
