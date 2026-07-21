@@ -36,7 +36,7 @@
 
 | Статус | Модуль | Файл | Назначение |
 |--------|--------|------|------------|
-| ⬜ | **ChatService** | `Services/ChatService.swift` | Чаты и сообщения (создание, история, редактирование) |
+| ✅ | **ChatService** | `Services/ChatService.swift` | Чаты и сообщения (создание, история, редактирование) |
 | ⬜ | **ContactsService** | `Services/ContactsService.swift` | Контакты, поиск, блокировки, профиль |
 | ⬜ | **CallService** | `Services/CallService.swift` | История звонков |
 
@@ -742,3 +742,213 @@ KeychainService.shared.delete(key: "access_token")
   можно расширить перегрузками для `Data`/`Codable`.
 - **Биометрия.** Доступ к особо чувствительным записям можно защитить
   `SecAccessControl` (Face ID / Touch ID), задав его в query при `save`.
+
+---
+
+## ChatService
+
+**Файл:** `FamilyTalk/Services/ChatService.swift`
+**Тип:** `final class` · синглтон (`ChatService.shared`)
+**Зависимость:** `NetworkService.shared`
+
+### Назначение
+
+`ChatService` — это **доменный REST-сервис чатов и сообщений**. Он инкапсулирует
+все HTTP-операции над сущностями «чат» (`Chat`) и «сообщение» (`Message`),
+которые выполняются по схеме «запрос-ответ» (в отличие от событий реального
+времени, которыми занимается `SocketService`). Модуль отвечает за:
+
+1. **Список чатов.** Загрузка всех чатов пользователя (`GET /chats`).
+2. **Создание чатов.** Личный диалог (`DIRECT`) и групповой чат (`GROUP`) через
+   один эндпоинт `POST /chats`, различаемые полем `type`.
+3. **История сообщений.** Постраничная (курсорная) выборка сообщений чата
+   (`GET /chats/:id/messages`).
+4. **Редактирование и удаление сообщений** (`PATCH` / `DELETE`
+   `/chats/:id/messages/:msgId`).
+
+Сервис **не хранит состояние** и **ничего не кэширует**: он лишь превращает вызовы
+методов в HTTP-запросы и возвращает декодированные модели. Хранение и обновление
+списка чатов/ленты сообщений — задача вызывающего слоя (ViewModel, фронтенд).
+
+### Место в системе: REST против реального времени
+
+Работа с сообщениями в FamilyTalk **разделена между двумя модулями**, и это
+ключевой момент для понимания:
+
+| Операция | Через кого идёт |
+|----------|-----------------|
+| Загрузка истории, создание чата, редактирование, удаление | **`ChatService`** (REST) |
+| Отправка нового сообщения, `read`-квитанции, `typing` | **`SocketService`** (WebSocket) |
+| Приём новых сообщений/квитанций/`typing` в реальном времени | **`SocketService`** (входящие события) |
+
+То есть **новое сообщение отправляется не через `ChatService`**, а через
+`SocketService.sendMessage(...)` (с ack-подтверждением). `ChatService` берёт на
+себя всё остальное: «холодную» загрузку истории при открытии чата и правки уже
+существующих сообщений. Это важно не перепутать при интеграции.
+
+### Связи с другими модулями
+
+```
+                     fetch/create/edit/delete
+   ChatViewModel ───────────────────────────►  ChatService
+   ChatsListViewModel                             (.shared)
+                                                     │ network.request(...)
+                                                     ▼
+                                               NetworkService
+                                                  (.shared)  ──► REST API
+                                                     ▲
+                     Server → Client (новые сообщения, ack, read, typing)
+   ChatViewModel ◄────────────────────────────  SocketService (.shared)
+```
+
+- **`NetworkService`** — единственная зависимость. `ChatService` хранит
+  `private let network = NetworkService.shared` и все методы делегирует
+  `network.request(...)`. Заголовки, авторизация (Bearer-токен), таймауты,
+  разбор дат и обработка ошибок — целиком на стороне `NetworkService`; здесь этой
+  логики нет.
+- **`SocketService`** — **дополняет** `ChatService`, а не заменяет: живой поток
+  сообщений и `typing`/`read` идёт через сокет. Типичный сценарий экрана чата:
+  сначала `ChatService.fetchMessages(...)` подгружает историю, затем UI подписан
+  на `SocketService.newMessage` для дозагрузки новых сообщений в реальном времени.
+- **Модели `Chat` / `Message`** (`Models/Chat.swift`, `Models/Message.swift`) —
+  контракт данных. Возвращаемые типы (`[Chat]`, `MessagesPage`, `Message`)
+  декодируются из JSON декодером `NetworkService`.
+- **Потребители (фронтенд).** `ChatViewModel` и `ChatsListViewModel` вызывают
+  методы сервиса и наблюдают результат — это презентационный слой, в данном
+  документе не рассматривается.
+
+### Модели данных
+
+Возвращаемые сущности описаны в слое `Models`:
+
+- **`Chat`** (`Models/Chat.swift`) — чат: `id`, `type: ChatType` (`.direct` /
+  `.group`), опциональные `name`/`avatarUrl`, `members: [ChatMember]`,
+  `lastMessage: Message?`, `unreadCount`. Есть помощники `displayName(currentUserId:)`
+  и `otherUser(currentUserId:)` для отображения диалога.
+- **`Message`** (`Models/Message.swift`) — сообщение: `id`, `chatId`, `senderId`,
+  `type: MessageType` (`.text` / `.system`), `content?`, `replyToId?`, `editedAt?`,
+  `deletedAt?`, `createdAt`, вложенные `sender: User?` и `replyTo: MessageReplyPreview?`.
+  Вычисляемые `isDeleted`, `isEdited`, `displayContent`.
+
+Обёртки ответов/запросов объявлены **приватно** внутри `ChatService` и наружу не
+торчат, кроме `MessagesPage` (она — публичный тип возврата истории):
+
+```swift
+struct MessagesPage: Codable {
+    let items: [Message]     // страница сообщений (по убыванию времени)
+    let nextCursor: String?  // курсор для подгрузки следующей страницы; nil — конец истории
+}
+```
+
+### Публичный API
+
+```swift
+static let shared: ChatService                       // единственный экземпляр
+
+// GET /chats — все чаты пользователя
+func fetchChats() async throws -> [Chat]
+
+// POST /chats (type = DIRECT) — личный диалог с пользователем
+func createDirectChat(targetUserId: String) async throws -> Chat
+
+// POST /chats (type = GROUP) — групповой чат
+func createGroupChat(name: String, memberIds: [String]) async throws -> Chat
+
+// GET /chats/:id/messages — страница истории (курсорная пагинация)
+func fetchMessages(chatId: String, cursor: String? = nil, limit: Int = 50) async throws -> MessagesPage
+
+// PATCH /chats/:id/messages/:msgId — изменить текст сообщения
+func editMessage(chatId: String, messageId: String, content: String) async throws -> Message
+
+// DELETE /chats/:id/messages/:msgId — удалить сообщение (у себя или у всех)
+func deleteMessage(chatId: String, messageId: String, forAll: Bool = false) async throws
+```
+
+### Как использовать
+
+**1. Загрузить список чатов (например, при открытии вкладки «Чаты»):**
+
+```swift
+let chats = try await ChatService.shared.fetchChats()
+```
+
+**2. Создать личный диалог или групповой чат:**
+
+```swift
+let direct = try await ChatService.shared.createDirectChat(targetUserId: user.id)
+
+let group = try await ChatService.shared.createGroupChat(
+    name: "Семья",
+    memberIds: [id1, id2, id3]
+)
+```
+
+**3. Постранично подгрузить историю (пагинация по курсору):**
+
+```swift
+var cursor: String? = nil
+let page = try await ChatService.shared.fetchMessages(chatId: chat.id, cursor: cursor)
+messages.append(contentsOf: page.items)
+cursor = page.nextCursor        // nil — история закончилась
+
+// подгрузка следующей страницы при скролле вверх:
+if let cursor {
+    let older = try await ChatService.shared.fetchMessages(chatId: chat.id, cursor: cursor)
+    // ...
+}
+```
+
+**4. Редактировать и удалять сообщение:**
+
+```swift
+let updated = try await ChatService.shared.editMessage(
+    chatId: chat.id, messageId: msg.id, content: "исправленный текст"
+)
+
+// удалить только у себя:
+try await ChatService.shared.deleteMessage(chatId: chat.id, messageId: msg.id)
+
+// удалить у всех участников:
+try await ChatService.shared.deleteMessage(chatId: chat.id, messageId: msg.id, forAll: true)
+```
+
+**Отправка нового сообщения — не здесь.** Для отправки используйте
+`SocketService.shared.sendMessage(chatId:content:replyToId:completion:)`.
+
+### Детали реализации, важные для интеграции
+
+- **Один эндпоинт на создание, разные тела.** И `createDirectChat`, и
+  `createGroupChat` бьют в `POST /chats`; сервер различает их по полю `type`
+  (`"DIRECT"` / `"GROUP"`) в теле запроса (`CreateDirectChatRequest` /
+  `CreateGroupChatRequest`).
+- **Курсорная пагинация, а не оффсетная.** `fetchMessages` возвращает
+  `MessagesPage` с `nextCursor`. Признак конца истории — `nextCursor == nil`.
+  Клиент передаёт полученный курсор в следующий вызов.
+- **Ограничение `limit`.** Значение зажимается `min(limit, 100)` — сервер не
+  отдаст больше 100 сообщений за раз, даже если запросить больше. По умолчанию 50.
+- **`deleteMessage` не возвращает данных.** Метод декодирует служебную обёртку
+  `{ "ok": Bool }` во внутренний тип и результат отбрасывает — важен лишь факт
+  успеха (иначе `NetworkService` бросит ошибку). Флаг `forAll` уходит в теле
+  `DELETE`-запроса и решает, удалить сообщение только у себя (`false`) или у всех
+  участников (`true`).
+- **`editMessage` возвращает обновлённое сообщение.** Ответ — актуальная модель
+  `Message` (с проставленным `editedAt`), её и следует положить в UI вместо
+  прежней версии.
+- **Без состояния и без кэша.** Сервис не держит список чатов/сообщений; каждый
+  вызов — самостоятельный запрос. Актуализацию данных обеспечивает вызывающий слой,
+  комбинируя REST-выборку с живыми событиями `SocketService`.
+- **Ошибки.** Все сбои приходят как `NetworkError` от `NetworkService`
+  (см. раздел «NetworkService → Обработка ошибок»); собственных типов ошибок у
+  `ChatService` нет.
+
+### Точки расширения
+
+- **Метки прочтения / счётчики.** Пометка «прочитано» и `unreadCount` сейчас
+  приходят через `SocketService` (`read`) и в модели `Chat`. Если появится
+  REST-эндпоинт массовой отметки прочтения, его логично добавить сюда.
+- **Вложения.** Сейчас сообщения текстовые (`content`). Загрузку медиа
+  (изображения/файлы) уместно оформить отдельными методами `ChatService`, оставив
+  реальный аплоад на `NetworkService`/выделенный сервис хранилища.
+- **Управление участниками группы.** Добавление/удаление участников, смена
+  названия/аватара группы пока не покрыты — это естественное расширение набора
+  методов вокруг `/chats/:id`.
