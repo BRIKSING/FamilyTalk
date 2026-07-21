@@ -23,7 +23,7 @@
 | Статус | Модуль | Файл | Назначение |
 |--------|--------|------|------------|
 | ✅ | **NetworkService** | `Services/NetworkService.swift` | Базовый HTTP/REST-клиент, транспорт для всех запросов |
-| ⬜ | **SocketService** | `Services/SocketService.swift` | Обмен событиями в реальном времени поверх Socket.IO |
+| ✅ | **SocketService** | `Services/SocketService.swift` | Обмен событиями в реальном времени поверх Socket.IO |
 
 ### Авторизация и безопасность
 
@@ -228,3 +228,220 @@ do {
   перехватить `401`, обновить токен и повторить запрос.
 - Логирование/метрики запросов также уместно добавить в единственный метод
   `request(...)`, не трогая доменные сервисы.
+
+---
+
+## SocketService
+
+**Файл:** `FamilyTalk/Services/SocketService.swift`
+**Тип:** `final class`, `@Observable`, `@unchecked Sendable` · синглтон (`SocketService.shared`)
+**Зависимость:** библиотека `SocketIO` (socket.io-client-swift)
+
+### Назначение
+
+`SocketService` — это **канал реального времени** приложения. Если
+`NetworkService` отвечает за разовые запрос-ответ по HTTP, то `SocketService`
+держит **постоянное WebSocket-соединение** с сервером через Socket.IO и
+обслуживает два потока событий, где данные приходят сами, без запроса:
+
+1. **Сигналинг звонков (WebRTC).** Обмен offer/answer/ICE-кандидатами и
+   командами завершения (`hangup`/`decline`) для установки P2P-звонка. Сам медиапоток
+   идёт напрямую между устройствами — через сокет летят только служебные сообщения.
+2. **События чата в реальном времени.** Новые сообщения, подтверждения доставки
+   (`ack`), отметки о прочтении (`read`) и индикаторы набора текста (`typing`).
+
+Модуль работает как **двунаправленный мост**:
+
+- **Server → Client (входящие):** обработчики в `setupHandlers()` разбирают
+  входящие события и публикуют их в наблюдаемые (`@Observable`) свойства. UI
+  подписан на эти свойства через `.onChange(of:)` и реагирует на изменения.
+- **Client → Server (исходящие):** методы группы `send…` сериализуют аргументы в
+  словарь и отправляют его через сокет (`emit` / `emitWithAck`).
+
+### Связи с другими модулями
+
+```
+                     token (после login/restore)
+   AuthService ──────────────────────────────────►  connect(token:)
+   AuthService ──────── logout() ─────────────────►  disconnect()
+                                                          │
+                                     ┌────────────────────┴─────────────────────┐
+                                     │              SocketService                │
+                                     │                (.shared)                  │
+   Client → Server:                  │   emit / emitWithAck                      │   Server → Client:
+   CallViewModel  ── sendOffer ─────►│ ◄──── URL = NetworkService.shared.baseURL │──► incomingCall/answeredCall/…
+                     sendAnswer …    │        (WebSocket поверх Socket.IO)       │──► newMessage/messageAck/…
+   ChatViewModel  ── sendMessage ───►│                                          │──► typingStart/typingStop
+                     sendRead/typing │                                          │
+                                     └───────────────────────────────────────────┘
+                                                          │ @Observable свойства
+                                                          ▼
+                        Views (ChatView, ChatsListView, CallView, ContactsView)
+                              .onChange(of: SocketService.shared.<event>)
+```
+
+- **Управление жизненным циклом — `AuthService`.** Соединение поднимается **не**
+  здесь, а в `AuthService`: после успешного логина или восстановления сессии
+  вызывается `connect(token:)`, а при `logout()` — `disconnect()`. `SocketService`
+  сам токен нигде не хранит — получает его аргументом.
+- **Адрес подключения — из `NetworkService`.** `connect(token:)` берёт
+  `NetworkService.shared.baseURL` как URL WebSocket-сервера. То есть REST и
+  WebSocket ходят на **один и тот же хост**; менять адрес нужно в одном месте — в
+  `NetworkService`.
+- **Разбор дат продублирован с `NetworkService`.** Приватный `static let decoder`
+  использует ту же кастомную стратегию ISO 8601 (с дробными долями секунды и без),
+  что и `NetworkService`. При изменении формата дат правьте **оба** места.
+- **Потребители исходящих методов:**
+  - `CallViewModel` → `sendOffer`, `sendAnswer`, `sendIceCandidate`, `sendHangup`,
+    `sendDecline`;
+  - `ChatViewModel` → `sendMessage`, `sendRead`, `sendTypingStart`, `sendTypingStop`.
+- **Потребители входящих событий (UI):** `CallView`, `ContactsView` (звонки),
+  `ChatView`, `ChatsListView` (сообщения/typing) подписываются на свойства через
+  `.onChange(of:)`.
+- **`CallService`** (REST, история звонков) **не** участвует в сигналинге — offer/
+  answer/hangup идут только через `SocketService`.
+
+### Модели событий (payloads)
+
+Входящие события представлены отдельными `Equatable`-структурами — это
+типобезопасная «граница» между сырыми словарями сокета и остальным приложением:
+
+| Структура | Событие сервера | Поля |
+|-----------|-----------------|------|
+| `IncomingCallEvent` | `call:incoming` | `callId`, `initiatorId`, `type: CallType`, `sdp` |
+| `CallAnsweredEvent` | `call:answered` | `callId`, `sdp` |
+| `IceCandidateEvent` | `call:ice-candidate` | `callId`, `fromUserId`, `candidate`, `sdpMid?`, `sdpMLineIndex?`, `usernameFragment?` |
+| `CallHangupEvent` | `call:hangup` / `call:declined` | `callId` |
+| `NewMessageEvent` | `message:new` | `message: Message` (+ вычисляемое `chatId`) |
+| `MessageAckEvent` | `message:ack` | `messageId`, `chatId` |
+| `MessageReadEvent` | `message:read` | `chatId`, `messageId`, `userId`, `readAt: Date` |
+| `TypingEvent` | `typing:start` / `typing:stop` | `chatId`, `userId` |
+
+### Публичный API
+
+#### Соединение
+
+```swift
+private(set) var isConnected: Bool          // текущее состояние подключения
+func connect(token: String)                 // поднять WebSocket (вызывает AuthService)
+func disconnect()                           // разорвать соединение (вызывает AuthService при logout)
+```
+
+`connect` настраивает `SocketManager` c авто-переподключением (`reconnects(true)`,
+бесконечные попытки `reconnectAttempts(-1)`, пауза `reconnectWait(2)`),
+принудительным WebSocket-транспортом и заголовком `Authorization: Bearer <token>`.
+
+#### Наблюдаемые события (Server → Client)
+
+Каждое свойство — «почтовый ящик» последнего события. UI читает его в `.onChange`
+и **сбрасывает в `nil`** после обработки, чтобы не обработать одно событие дважды:
+
+```swift
+// Звонки:
+var incomingCall:  IncomingCallEvent?
+var answeredCall:  CallAnsweredEvent?
+var iceCandidate:  IceCandidateEvent?
+var remoteHangup:  CallHangupEvent?
+var remoteDeclined: CallHangupEvent?
+
+// Чат:
+var newMessage:  NewMessageEvent?
+var messageAck:  MessageAckEvent?
+var messageRead: MessageReadEvent?
+var typingStart: TypingEvent?
+var typingStop:  TypingEvent?
+```
+
+#### Исходящие методы — звонки (Client → Server)
+
+```swift
+func sendOffer(targetUserId: String, sdp: String, type: CallType)
+func sendAnswer(callId: String, targetUserId: String, sdp: String)
+func sendIceCandidate(callId: String, targetUserId: String, candidate: String,
+                      sdpMid: String?, sdpMLineIndex: Int?, usernameFragment: String?)
+func sendHangup(callId: String, targetUserId: String)
+func sendDecline(callId: String, targetUserId: String)
+```
+
+#### Исходящие методы — чат (Client → Server)
+
+```swift
+// Отправка сообщения с подтверждением сервера (Socket.IO ack, таймаут 5 c).
+// completion(true) — сервер принял; completion(false) — нет соединения или таймаут.
+func sendMessage(chatId: String, content: String, replyToId: String? = nil,
+                 completion: ((Bool) -> Void)? = nil)
+
+func sendRead(chatId: String, messageId: String)
+func sendTypingStart(chatId: String)
+func sendTypingStop(chatId: String)
+```
+
+### Как использовать
+
+**1. Поднять/разорвать соединение (обычно этим занимается только `AuthService`):**
+
+```swift
+SocketService.shared.connect(token: response.accessToken)   // после логина
+SocketService.shared.disconnect()                           // при выходе
+```
+
+**2. Отправить сообщение и отреагировать на подтверждение (оптимистичный UI):**
+
+```swift
+SocketService.shared.sendMessage(chatId: chat.id, content: text) { success in
+    if success {
+        // пометить локальное сообщение как доставленное
+    } else {
+        // показать статус ошибки/повторной отправки
+    }
+}
+```
+
+**3. Подписаться на входящее событие в SwiftUI и сбросить его после обработки:**
+
+```swift
+.onChange(of: SocketService.shared.newMessage) { _, event in
+    guard let event else { return }
+    viewModel.append(event.message)
+    SocketService.shared.newMessage = nil   // важно: сброс, чтобы не обработать повторно
+}
+```
+
+**4. Индикатор набора текста:**
+
+```swift
+SocketService.shared.sendTypingStart(chatId: chat.id)   // пользователь начал печатать
+SocketService.shared.sendTypingStop(chatId: chat.id)    // остановился/отправил
+```
+
+### Детали реализации, важные для интеграции
+
+- **Потокобезопасность.** Класс помечен `@unchecked Sendable`, потому что
+  `socket.io-client-swift` не поддерживает Swift 6 Sendable. Инвариант держится
+  вручную: **все мутации наблюдаемых свойств выполняются на `DispatchQueue.main`**.
+  Обработчики сокета приходят с фонового потока и всегда переключаются на главный.
+- **`@ObservationIgnored`.** Служебные объекты (`manager`, `socket`, `decoder`)
+  исключены из наблюдения `@Observable` — на них UI не подписывается.
+- **Модель «событие → свойство → сброс в nil».** Свойства хранят *последнее*
+  событие. Ответственность за сброс (`= nil`) лежит на UI после обработки. Если не
+  сбрасывать — событие может «залипнуть» и обработаться повторно при следующем
+  изменении.
+- **Гварды на соединение.** Приватный `emit(...)` и `sendMessage(...)` проверяют
+  `isConnected`: без активного соединения событие не отправляется (а `sendMessage`
+  сразу вызывает `completion(false)`).
+- **`emitWithAck` только для `sendMessage`.** Только отправка сообщения ждёт
+  подтверждения сервера (таймаут 5 c). Остальные `send…` — «выстрелил и забыл».
+- **Разбор `candidate`.** Для `call:ice-candidate` вложенный словарь `candidate`
+  разбирается вручную (строка + опциональные `sdpMid`/`sdpMLineIndex`/
+  `usernameFragment`).
+
+### Точки расширения
+
+- **Единая обёртка события.** Сейчас каждый обработчик руками достаёт поля из
+  словаря. При росте числа событий можно ввести общий типобезопасный декодер
+  (по аналогии с `decode(_:from:)`, который уже используется для `message:new`).
+- **Реконнект и восстановление состояния.** Авто-переподключение включено на
+  уровне транспорта, но прикладного «догона» пропущенных событий после
+  переподключения нет — при необходимости это добавляется здесь.
+- **Наблюдаемость.** Логирование сейчас отключено (`.log(false)`); диагностику
+  соединения/событий логично включать/собирать в `setupHandlers()`.
