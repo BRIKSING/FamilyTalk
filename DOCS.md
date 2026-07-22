@@ -38,7 +38,7 @@
 |--------|--------|------|------------|
 | ✅ | **ChatService** | `Services/ChatService.swift` | Чаты и сообщения (создание, история, редактирование) |
 | ✅ | **ContactsService** | `Services/ContactsService.swift` | Контакты, поиск, блокировки, профиль |
-| ⬜ | **CallService** | `Services/CallService.swift` | История звонков |
+| ✅ | **CallService** | `Services/CallService.swift` | История звонков (REST) |
 
 ### Слой данных (Models)
 
@@ -1218,3 +1218,205 @@ do {
   повысит долю совпадений при `syncContacts` — её уместно встроить в `sha256`-конвейер.
 - **Кэширование.** Модуль намеренно без кэша. Список контактов/блокировок при
   необходимости офлайн-доступа можно кэшировать внутри сервиса, не меняя публичный API.
+
+---
+
+## CallService
+
+**Файл:** `FamilyTalk/Services/CallService.swift`
+**Тип:** `final class` · синглтон (`CallService.shared`)
+**Зависимость:** `NetworkService.shared` (весь транспорт идёт через него)
+
+### Назначение
+
+`CallService` — это **доменный REST-сервис истории звонков**. Его единственная
+задача — отдавать **журнал звонков** пользователя постранично (курсорная
+пагинация), чтобы показать экран «Недавние» / список последних вызовов.
+
+Ключевая граница ответственности, как и у `ChatService`: **`CallService` отвечает
+только за REST-историю, а не за сам звонок.** Установка соединения и весь сигналинг
+(offer/answer/ICE-кандидаты/hangup/decline) идут **не** здесь, а через
+`SocketService` (WebSocket, см. раздел «SocketService»). Медиапоток (аудио/видео)
+идёт напрямую между устройствами по WebRTC. `CallService` вступает в игру уже
+**после** звонка: сервер записывает факт вызова в журнал, а этот сервис его читает.
+
+Модуль сознательно **минималистичен** — один публичный метод `fetchHistory`. Как и
+остальные доменные сервисы, он сам с сетью не работает: строит query-параметры и
+делегирует выполнение в `NetworkService`, получая обратно уже декодированную
+типобезопасную страницу `CallHistoryPage`.
+
+### Связи с другими модулями
+
+```
+   CallHistoryViewModel ──────► CallService.shared
+     (фронтенд, планируется)       │
+                                   │ request<CallHistoryPage>(endpoint, queryItems)
+                                   ▼
+                            NetworkService.shared ──► URLSession ──► REST API
+                                   ▲                    GET /calls/history
+                                   │  токен (Bearer) уже проставлен AuthService
+                                   │
+   Модели-контракты: CallLog, CallType, CallStatus, User
+
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ Разделение ответственности звонка:                                   │
+   │   SocketService  — сигналинг вживую (offer/answer/ice/hangup)        │
+   │   WebRTC (P2P)   — сам медиапоток аудио/видео                        │
+   │   CallService    — REST-журнал уже состоявшихся звонков (эта тема)   │
+   └─────────────────────────────────────────────────────────────────────┘
+```
+
+- **Транспорт — `NetworkService`.** Сервис хранит
+  `private let network = NetworkService.shared` и делает вызов через
+  `network.request(...)`. Авторизация (заголовок `Authorization: Bearer <token>`),
+  таймауты, проверка HTTP-статуса, разбор дат и маппинг ошибок в `NetworkError` —
+  всё это происходит в `NetworkService`; `CallService` про это ничего не знает.
+- **Авторизация — косвенно через `AuthService`.** Метод идёт с `requiresAuth: true`
+  (значение по умолчанию в `NetworkService`). Токен в `NetworkService` кладёт
+  `AuthService` при входе/восстановлении сессии; при `401` централизованно
+  происходит `logout()`. Сам `CallService` в авторизацию не вмешивается.
+- **Разделение с `SocketService`.** Это важнейшая связь для понимания модуля.
+  `SocketService` обслуживает **живой** звонок (события `call:incoming`,
+  `call:answered`, `call:ice-candidate`, `call:hangup`/`call:declined` и исходящие
+  `sendOffer`/`sendAnswer`/`sendIceCandidate`/`sendHangup`/`sendDecline`).
+  `CallService` в сигналинге **не участвует** — он лишь читает журнал звонков,
+  который сервер сформировал по итогам этих событий. Типичный жизненный цикл:
+  `SocketService` провёл звонок → сервер записал `CallLog` → `CallService.fetchHistory`
+  показал его в списке недавних.
+- **Модели-контракты — `CallLog`, `CallType`, `CallStatus`, `User`**
+  (`Models/CallLog.swift`). Страница `CallHistoryPage` несёт массив `CallLog`;
+  внутри каждого `CallLog` опционально вложены профили `initiator`/`target` (`User`) —
+  та же доменная модель пользователя, что и в остальных сервисах. `CallType`
+  (`.voice`/`.video`) переиспользуется `SocketService` в событиях звонка.
+- **Потребитель (фронтенд).** Экран истории звонков (view model журнала вызовов) —
+  презентационный слой; в данном документе он не рассматривается. На момент
+  написания прямых вызовов `CallService` в кодовой базе ещё нет — сервис готов к
+  подключению экрана «Недавние».
+
+### Модель данных
+
+Сервис оперирует моделью **`CallLog`** (`Identifiable, Codable`):
+
+| Поле | Тип | Смысл |
+|------|-----|-------|
+| `id` | `String` | Идентификатор записи звонка |
+| `initiatorId` | `String` | Кто инициировал звонок |
+| `targetId` | `String` | Кому звонили |
+| `type` | `CallType` | `.voice` (`"VOICE"`) или `.video` (`"VIDEO"`) |
+| `status` | `CallStatus?` | `.accepted` / `.declined` / `.missed` (может отсутствовать) |
+| `startedAt` | `Date?` | Момент начала разговора (`nil`, если не состоялся) |
+| `endedAt` | `Date?` | Момент завершения |
+| `createdAt` | `Date` | Момент создания записи (сам факт вызова) |
+| `initiator` | `User?` | Вложенный профиль инициатора |
+| `target` | `User?` | Вложенный профиль вызываемого |
+
+Перечисления:
+
+- **`CallType`** — `.voice` (`"VOICE"`) / `.video` (`"VIDEO"`).
+- **`CallStatus`** — `.accepted` (`"ACCEPTED"`) / `.declined` (`"DECLINED"`) /
+  `.missed` (`"MISSED"`).
+
+У `CallLog` есть два вычисляемых свойства для UI:
+
+- **`duration`** — `TimeInterval?`: длительность разговора (`endedAt − startedAt`)
+  или `nil`, если звонок не состоялся (нет `startedAt`/`endedAt`).
+- **`durationText`** — строка `"м:сс"` (например `"2:07"`) либо `"—"`, если
+  длительности нет. Удобно выводить в списке без доп. форматирования.
+
+### Публичный API
+
+```swift
+static let shared: CallService                     // единственный экземпляр
+
+// GET /calls/history — страница журнала звонков (курсорная пагинация)
+func fetchHistory(cursor: String? = nil, limit: Int = 20) async throws -> CallHistoryPage
+```
+
+Тип **`CallHistoryPage`** — публичная модель страницы истории (по устройству
+идентична `MessagesPage` из `ChatService`):
+
+```swift
+struct CallHistoryPage: Codable {
+    let items: [CallLog]        // звонки страницы
+    let nextCursor: String?     // курсор следующей страницы; nil — история закончилась
+}
+```
+
+### Как использовать
+
+**1. Загрузить первую страницу истории звонков (экран «Недавние»):**
+
+```swift
+let page = try await CallService.shared.fetchHistory()   // GET /calls/history?limit=20
+display(page.items)
+```
+
+**2. Постраничная подгрузка (бесконечный скролл вниз):**
+
+```swift
+var cursor: String? = nil
+repeat {
+    let page = try await CallService.shared.fetchHistory(cursor: cursor, limit: 20)
+    display(page.items)
+    cursor = page.nextCursor          // nil → истории больше нет
+} while cursor != nil
+```
+
+**3. Показать участника и длительность записи:**
+
+```swift
+for log in page.items {
+    let peerName = log.target?.displayName ?? log.initiator?.displayName ?? "—"
+    let kind = log.type == .video ? "Видео" : "Аудио"
+    print("\(kind) · \(peerName) · \(log.durationText)")   // напр. "Аудио · Дмитрий · 2:07"
+}
+```
+
+### Обработка ошибок
+
+Отдельного типа ошибок у `CallService` нет — наружу пробрасываются те же
+`NetworkError`, что и из `NetworkService` (см. раздел «NetworkService → Обработка
+ошибок»). Шаблон вызова:
+
+```swift
+do {
+    let page = try await CallService.shared.fetchHistory()
+    // ...
+} catch let error as NetworkError {
+    print(error.errorDescription ?? "Ошибка загрузки истории звонков")
+}
+```
+
+### Детали реализации, важные для интеграции
+
+- **Синглтон без состояния.** `CallService.shared`, `init` приватный. Класс не
+  хранит кэшей и изменяемого состояния — это чистый «фасад» над одним REST-эндпоинтом,
+  поэтому безопасен для вызова из любого места.
+- **Ограничение `limit`.** `fetchHistory` **зажимает** лимит: `min(limit, 100)`.
+  Даже если запросить больше 100, уйдёт максимум 100 — учитывайте это при
+  проектировании пагинации. Значение по умолчанию — `20`.
+- **Курсорная пагинация.** Историю отдаёт `CallHistoryPage` с `nextCursor`. Признак
+  конца — `nextCursor == nil`. Курсор непрозрачен для клиента: его не нужно
+  разбирать, только передавать обратно в следующий запрос (та же модель, что в
+  `ChatService.fetchMessages`).
+- **Только чтение.** Сервис ничего не создаёт и не меняет — записи в журнал
+  формирует сервер по итогам сигналинга через `SocketService`. Отсюда `CallService`
+  их только читает.
+- **Опциональные поля `CallLog`.** `status`, `startedAt`, `endedAt`, `initiator`,
+  `target` — опциональны. Для несостоявшегося звонка (`.missed`) длительности не
+  будет; для корректного UI полагайтесь на `durationText` и на проверку `status`, а
+  не на предположение, что даты всегда заполнены.
+
+### Точки расширения
+
+- **Фильтрация журнала.** Сейчас `fetchHistory` отдаёт единый список. Естественное
+  расширение — фильтры (только пропущенные, только видео, по конкретному собеседнику)
+  через дополнительные query-параметры, по аналогии с уже существующим `limit`.
+- **Удаление/очистка истории.** Методы `DELETE /calls/history` (очистить всё) или
+  `DELETE /calls/:id` (удалить запись) логично добавить сюда рядом с `fetchHistory`.
+- **Обратный вызов из истории.** «Перезвонить» из журнала — это уже инициация нового
+  звонка через `SocketService.sendOffer` (по `initiatorId`/`targetId` записи), а не
+  задача `CallService`; сервис лишь поставляет данные для такой кнопки.
+- **Кэширование.** Модуль намеренно без кэша. При необходимости офлайн-доступа слой
+  кэша (память/БД) можно встроить в `CallService`, оставив публичную сигнатуру
+  неизменной.
