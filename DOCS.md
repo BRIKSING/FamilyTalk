@@ -38,7 +38,7 @@
 |--------|--------|------|------------|
 | ✅ | **ChatService** | `Services/ChatService.swift` | Чаты и сообщения (создание, история, редактирование) |
 | ✅ | **ContactsService** | `Services/ContactsService.swift` | Контакты, поиск, блокировки, профиль |
-| ⬜ | **CallService** | `Services/CallService.swift` | История звонков |
+| ✅ | **CallService** | `Services/CallService.swift` | История звонков |
 
 ### Слой данных (Models)
 
@@ -1218,3 +1218,198 @@ do {
   повысит долю совпадений при `syncContacts` — её уместно встроить в `sha256`-конвейер.
 - **Кэширование.** Модуль намеренно без кэша. Список контактов/блокировок при
   необходимости офлайн-доступа можно кэшировать внутри сервиса, не меняя публичный API.
+
+---
+
+## CallService
+
+**Файл:** `FamilyTalk/Services/CallService.swift`
+**Тип:** `final class` · синглтон (`CallService.shared`)
+**Зависимость:** `NetworkService.shared` (весь транспорт идёт через него)
+
+### Назначение
+
+`CallService` — это **доменный REST-сервис истории звонков**. Его единственная
+задача — отдать журнал совершённых, принятых и пропущенных звонков постранично
+(курсорная пагинация). Это самый маленький из доменных сервисов: у него один метод
+`fetchHistory(...)` и никакого изменяемого состояния.
+
+Ключевая граница ответственности здесь особенно важна: **`CallService` НЕ участвует
+в самом звонке.** Установка соединения, обмен offer/answer/ICE-кандидатами и команды
+`hangup`/`decline` — это **сигналинг**, и он идёт **только** через `SocketService`
+(WebSocket) и WebRTC (см. раздел «SocketService»). `CallService` работает уже
+**постфактум**: когда звонок состоялся (или был пропущен), сервер записывает его в
+журнал, а этот сервис просто читает готовые записи по HTTP. Проще говоря:
+
+- **«Как звонить»** — `SocketService` (реалтайм-сигналинг).
+- **«Что было раньше»** — `CallService` (REST-история).
+
+Как и остальные доменные сервисы, модуль сам с сетью не работает: он строит
+query-параметры запроса и делегирует выполнение в `NetworkService`, получая обратно
+уже декодированную типобезопасную модель `CallHistoryPage`.
+
+### Связи с другими модулями
+
+```
+   CallViewModel ───────────► CallService.shared
+   (экран «Звонки», фронтенд)     │
+                                  │ request<CallHistoryPage>(endpoint, queryItems)
+                                  ▼
+                           NetworkService.shared ──► URLSession ──► REST API
+                                  ▲
+                                  │  токен (Bearer) уже проставлен AuthService
+                                  │
+   Модель-контракт: CallLog (+ вложенные User: initiator/target, enum CallType/CallStatus)
+
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ РАЗДЕЛЕНИЕ ОТВЕТСТВЕННОСТИ ЗВОНКА                                  │
+   │   SocketService  → сигналинг (offer/answer/ice/hangup/decline)    │
+   │   CallService    → история (GET /calls/history) — только чтение   │
+   └─────────────────────────────────────────────────────────────────┘
+```
+
+- **Транспорт — `NetworkService`.** Сервис хранит
+  `private let network = NetworkService.shared` и делает единственный вызов через
+  `network.request(...)`. Авторизация (заголовок `Authorization: Bearer <token>`),
+  таймауты, проверка HTTP-статуса, разбор дат и маппинг ошибок в `NetworkError` —
+  всё это происходит в `NetworkService`; `CallService` про это ничего не знает.
+- **Авторизация — косвенно через `AuthService`.** Метод идёт с `requiresAuth: true`
+  (значение по умолчанию в `NetworkService`). Токен в `NetworkService` кладёт
+  `AuthService` при входе/восстановлении сессии; при `401` централизованно
+  происходит `logout()`. Сам `CallService` в авторизацию не вмешивается.
+- **Разделение с `SocketService`.** Это главная связь, которую нужно держать в
+  голове: `CallService` и `SocketService` покрывают **разные фазы** одного звонка.
+  Живой звонок целиком обслуживает `SocketService` (`sendOffer`/`sendAnswer`/
+  `sendIceCandidate`/`sendHangup`/`sendDecline` и входящие события
+  `incomingCall`/`answeredCall`/…). `CallService` подключается только для
+  отображения журнала прошедших звонков. Между ними нет прямого вызова — их
+  связывает лишь общая модель `CallLog`/`CallType`.
+- **Модель-контракт — `CallLog`** (`Models/CallLog.swift`). Метод возвращает
+  страницу `CallHistoryPage` со списком `CallLog`. Внутри `CallLog` переиспользуется
+  доменный тип `User` (поля `initiator`/`target`) и перечисление `CallType`
+  (`.voice`/`.video`), которое **общее с сигналингом** — то же `CallType` фигурирует
+  в `SocketService.sendOffer(...)` и событии `IncomingCallEvent`.
+- **Потребитель (фронтенд).** Экран истории звонков (`CallViewModel`/`CallsView`)
+  вызывает `fetchHistory`. Это презентационный слой и в данном документе подробно
+  не рассматривается.
+
+### Модель данных
+
+Сервис оперирует моделью **`CallLog`** (`Identifiable, Codable`):
+
+| Поле | Тип | Смысл |
+|------|-----|-------|
+| `id` | `String` | Идентификатор записи звонка |
+| `initiatorId` | `String` | Кто инициировал звонок |
+| `targetId` | `String` | Кому звонили |
+| `type` | `CallType` | `.voice` (`"VOICE"`) или `.video` (`"VIDEO"`) |
+| `status` | `CallStatus?` | `.accepted` / `.declined` / `.missed` (может отсутствовать) |
+| `startedAt` | `Date?` | Момент фактического начала разговора (nil, если не состоялся) |
+| `endedAt` | `Date?` | Момент завершения |
+| `createdAt` | `Date` | Момент создания записи (когда звонок инициировали) |
+| `initiator` | `User?` | Вложенный профиль инициатора |
+| `target` | `User?` | Вложенный профиль вызываемого |
+
+Вычисляемые свойства для UI:
+
+- **`duration: TimeInterval?`** — длительность разговора (`endedAt − startedAt`);
+  `nil`, если звонок не состоялся (нет `startedAt`/`endedAt`).
+- **`durationText: String`** — та же длительность в формате `M:SS` (например,
+  `"3:07"`), либо `"—"`, если длительности нет.
+
+Перечисления **`CallType`** (`VOICE`/`VIDEO`) и **`CallStatus`**
+(`ACCEPTED`/`DECLINED`/`MISSED`) — `String`-`Codable`; значения на сервере хранятся
+в верхнем регистре.
+
+### Публичный API
+
+```swift
+static let shared: CallService                     // единственный экземпляр
+
+// GET /calls/history — страница журнала звонков (курсорная пагинация)
+func fetchHistory(cursor: String? = nil, limit: Int = 20) async throws -> CallHistoryPage
+```
+
+Тип **`CallHistoryPage`** — публичная модель страницы истории (по аналогии с
+`MessagesPage` у `ChatService`):
+
+```swift
+struct CallHistoryPage: Codable {
+    let items: [CallLog]        // записи звонков на странице
+    let nextCursor: String?     // курсор следующей страницы; nil — история закончилась
+}
+```
+
+### Как использовать
+
+**1. Загрузить первую страницу истории звонков (например, при открытии вкладки
+«Звонки»):**
+
+```swift
+let page = try await CallService.shared.fetchHistory()   // GET /calls/history?limit=20
+display(page.items)
+```
+
+**2. Постраничная подгрузка (бесконечный скролл вниз):**
+
+```swift
+var cursor: String? = nil
+repeat {
+    let page = try await CallService.shared.fetchHistory(cursor: cursor, limit: 20)
+    display(page.items)
+    cursor = page.nextCursor          // nil → истории больше нет
+} while cursor != nil
+```
+
+**3. Показать длительность и тип звонка в списке:**
+
+```swift
+ForEach(page.items) { call in
+    let icon = call.type == .video ? "video.fill" : "phone.fill"
+    Text(call.durationText)           // "3:07" или "—" для несостоявшихся
+}
+```
+
+### Обработка ошибок
+
+Отдельного типа ошибок у `CallService` нет — наружу пробрасываются те же
+`NetworkError`, что и из `NetworkService` (см. раздел «NetworkService → Обработка
+ошибок»). Шаблон вызова:
+
+```swift
+do {
+    let page = try await CallService.shared.fetchHistory()
+    // ...
+} catch let error as NetworkError {
+    print(error.errorDescription ?? "Ошибка загрузки истории звонков")
+}
+```
+
+### Детали реализации, важные для интеграции
+
+- **Синглтон без состояния.** `CallService.shared`, `init` приватный. Класс не
+  хранит кэшей и изменяемого состояния — это чистый «фасад» над одним
+  REST-эндпоинтом, поэтому безопасен для вызова из любого места.
+- **Ограничение `limit`.** Как и `ChatService.fetchMessages`, метод **зажимает**
+  лимит: `min(limit, 100)`. Даже если запросить больше 100, уйдёт максимум 100 —
+  учитывайте это при проектировании пагинации. Значение по умолчанию — `20`.
+- **Курсорная пагинация.** Историю отдаёт `CallHistoryPage` с `nextCursor`. Признак
+  конца — `nextCursor == nil`. Курсор непрозрачен для клиента: его не нужно
+  разбирать, только передавать обратно в следующий запрос.
+- **Только чтение.** У сервиса нет методов записи: запись звонка в журнал — задача
+  сервера (по итогам сигналинга через сокет), клиент историю не создаёт и не
+  редактирует.
+- **`status`/`startedAt`/`endedAt` опциональны.** У пропущенного или отклонённого
+  звонка может не быть времени начала/окончания разговора — всегда учитывайте `nil`
+  (для этого и существуют `duration`/`durationText`, которые сами обрабатывают
+  отсутствие данных).
+
+### Точки расширения
+
+- **Фильтрация журнала.** Сейчас `fetchHistory` отдаёт единый поток. При
+  необходимости сюда логично добавить фильтры (только пропущенные, по типу
+  `voice`/`video`, по конкретному собеседнику) через дополнительные query-параметры.
+- **Удаление/очистка истории.** REST-операции `DELETE /calls/history` или удаление
+  отдельной записи — естественное расширение сервиса рядом с `fetchHistory`.
+- **Кэширование.** Модуль намеренно без кэша. Журнал звонков при необходимости
+  офлайн-доступа можно кэшировать внутри сервиса, не меняя публичный API.
