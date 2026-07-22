@@ -37,7 +37,7 @@
 | Статус | Модуль | Файл | Назначение |
 |--------|--------|------|------------|
 | ✅ | **ChatService** | `Services/ChatService.swift` | Чаты и сообщения (создание, история, редактирование) |
-| ⬜ | **ContactsService** | `Services/ContactsService.swift` | Контакты, поиск, блокировки, профиль |
+| ✅ | **ContactsService** | `Services/ContactsService.swift` | Контакты, поиск, блокировки, профиль |
 | ⬜ | **CallService** | `Services/CallService.swift` | История звонков |
 
 ### Слой данных (Models)
@@ -998,3 +998,223 @@ do {
 - **Кэширование.** Модуль намеренно без кэша. При необходимости офлайн-доступа
   слой кэша (память/БД) можно встроить в `ChatService`, оставив публичные сигнатуры
   неизменными.
+
+---
+
+## ContactsService
+
+**Файл:** `FamilyTalk/Services/ContactsService.swift`
+**Тип:** `final class` · синглтон (`ContactsService.shared`)
+**Зависимости:** `NetworkService.shared` (транспорт) · системный фреймворк `CryptoKit` (SHA-256)
+
+### Назначение
+
+`ContactsService` — это **доменный REST-сервис адресной книги, поиска людей,
+блокировок и собственного профиля**. Он покрывает все «разовые» (request-response)
+операции вокруг пользователей приложения, у которых нет реалтайм-потока:
+
+1. **Контакты.** Получить список контактов пользователя (`fetchContacts`) и
+   синхронизировать их с телефонной книгой устройства (`syncContacts`).
+2. **Поиск.** Найти пользователей по строке запроса — имени/username (`searchUsers`).
+3. **Блокировки.** Заблокировать/разблокировать пользователя и получить список
+   заблокированных (`blockUser`, `unblockUser`, `fetchBlocked`).
+4. **Профиль.** Отредактировать собственный профиль — отображаемое имя, username,
+   «о себе» (`updateProfile`, `PATCH /users/me`).
+
+Ключевая приватная особенность модуля — **синхронизация контактов идёт по хешам, а
+не по «сырым» номерам**. Перед отправкой каждый телефонный номер локально хешируется
+алгоритмом **SHA-256** (`CryptoKit`), и на сервер уходят только шестнадцатеричные
+хеши. Так сервер может сматчить контакты между пользователями, **не получая и не
+храня открытые номера телефонов** из адресной книги — это осознанное решение в
+пользу приватности.
+
+Как и остальные доменные сервисы, `ContactsService` сам с сетью не работает: он
+строит путь, query-параметры и тело запроса и делегирует выполнение в
+`NetworkService`, получая обратно уже декодированные типобезопасные модели `User`.
+
+### Связи с другими модулями
+
+```
+   ContactsViewModel ────────► ContactsService.shared
+     (фронтенд)                    │
+                                   │ request<T>(endpoint, method, body, queryItems)
+                                   ▼
+                            NetworkService.shared ──► URLSession ──► REST API
+                                   ▲
+                                   │  токен (Bearer) уже проставлен AuthService
+                                   │
+   Локально:  phoneNumbers ──[ SHA-256 (CryptoKit) ]──► hashes ──► POST /users/contacts/sync
+   Модель-контракт: User
+```
+
+- **Транспорт — `NetworkService`.** Сервис хранит
+  `private let network = NetworkService.shared` и все вызовы делает через
+  `network.request(...)`. Авторизация, таймауты, проверка HTTP-статуса, разбор дат
+  и маппинг ошибок в `NetworkError` — всё это происходит в `NetworkService`;
+  `ContactsService` про это ничего не знает.
+- **Авторизация — косвенно через `AuthService`.** Все методы идут с
+  `requiresAuth: true` (значение по умолчанию в `NetworkService`). Токен в
+  `NetworkService` кладёт `AuthService`; при `401` централизованно происходит
+  `logout()`. Сам `ContactsService` в авторизацию не вмешивается.
+- **`CryptoKit` — локальное хеширование.** Единственный «не сетевой» участник:
+  приватный `sha256(_:)` превращает номер в hex-строку SHA-256. Открытые номера за
+  пределы устройства не уходят.
+- **Модель-контракт — `User`** (`Models/User.swift`). Все методы возвращают либо
+  `User`, либо `[User]`. Это та же модель, что используется в `AuthService`
+  (профиль), `ChatService`/`SocketService` (автор сообщения, участники чата), —
+  единый доменный тип пользователя на всё приложение.
+- **Пересечение с чатами.** Найденный или синхронизированный `User` — типичная
+  «точка входа» в переписку: по `user.id` затем вызывается
+  `ChatService.createDirectChat(targetUserId:)`. Сам `ContactsService` чаты не
+  создаёт — он только отдаёт пользователей.
+- **Потребитель (фронтенд).** `ContactsViewModel` вызывает `fetchContacts` и
+  `searchUsers` и наблюдается экраном `ContactsView`. Это презентационный слой и в
+  данном документе подробно не рассматривается.
+
+### Модель данных
+
+Сервис оперирует единственной доменной моделью — **`User`**
+(`Identifiable, Codable, Equatable`):
+
+| Поле | Тип | Смысл |
+|------|-----|-------|
+| `id` | `String` | Идентификатор пользователя |
+| `displayName` | `String` | Отображаемое имя |
+| `phone` | `String?` | Телефон (может отсутствовать в выдаче) |
+| `username` | `String?` | Уникальный ник (`@username`) |
+| `avatarUrl` | `String?` | Ссылка на аватар |
+| `bio` | `String?` | «О себе» |
+| `lastSeen` | `Date?` | Момент последней активности |
+
+У `User` есть два вычисляемых свойства для UI, полезных при работе с контактами:
+
+- **`isOnline`** — `true`, если с `lastSeen` прошло меньше 30 секунд.
+- **`lastSeenText`** — человекочитаемая строка активности на русском
+  (`"только что"`, `"5 мин назад"`, `"2 ч назад"`, либо дата `dd.MM.yyyy`).
+
+### Публичный API
+
+```swift
+static let shared: ContactsService                 // единственный экземпляр
+
+// GET /users/contacts — список контактов пользователя
+func fetchContacts() async throws -> [User]
+
+// POST /users/contacts/sync — синхронизация по SHA-256-хешам номеров;
+// возвращает контакты, найденные среди пользователей приложения
+func syncContacts(phoneNumbers: [String]) async throws -> [User]
+
+// GET /users/search?q= — поиск пользователей по имени/username
+func searchUsers(query: String) async throws -> [User]
+
+// POST /users/:id/block — заблокировать пользователя
+func blockUser(id: String) async throws
+
+// DELETE /users/:id/block — разблокировать пользователя
+func unblockUser(id: String) async throws
+
+// GET /users/blocked — список заблокированных пользователей
+func fetchBlocked() async throws -> [User]
+
+// PATCH /users/me — обновить собственный профиль (любое подмножество полей)
+func updateProfile(displayName: String? = nil,
+                   username: String? = nil,
+                   bio: String? = nil) async throws -> User
+```
+
+Обёртки запросов/ответов (`ContactsResponse`, `UsersResponse`, `OkResponse`,
+`ContactSyncRequest`, `UpdateProfileRequest`) — **приватные**: снаружи они не видны,
+наружу отдаются уже развёрнутые доменные типы (`[User]`, `User`).
+
+### Как использовать
+
+**1. Загрузить контакты (например, при открытии вкладки «Контакты»):**
+
+```swift
+let contacts = try await ContactsService.shared.fetchContacts()   // GET /users/contacts
+```
+
+**2. Синхронизировать телефонную книгу (номера хешируются автоматически):**
+
+```swift
+// phoneNumbers — «сырые» номера из адресной книги устройства;
+// наружу уходят только их SHA-256-хеши
+let matched = try await ContactsService.shared.syncContacts(
+    phoneNumbers: ["+79991234567", "+79997654321"]
+)
+// matched — пользователи FamilyTalk, найденные среди контактов
+```
+
+**3. Найти пользователя и начать с ним чат:**
+
+```swift
+let found = try await ContactsService.shared.searchUsers(query: "дмитрий")
+if let user = found.first {
+    let chat = try await ChatService.shared.createDirectChat(targetUserId: user.id)
+}
+```
+
+**4. Заблокировать / разблокировать и посмотреть список блокировок:**
+
+```swift
+try await ContactsService.shared.blockUser(id: user.id)
+let blocked = try await ContactsService.shared.fetchBlocked()
+try await ContactsService.shared.unblockUser(id: user.id)
+```
+
+**5. Обновить собственный профиль (передаются только меняющиеся поля):**
+
+```swift
+// изменить только «о себе», не трогая имя и username
+let me = try await ContactsService.shared.updateProfile(bio: "Люблю горы")
+```
+
+### Обработка ошибок
+
+Отдельного типа ошибок у `ContactsService` нет — наружу пробрасываются те же
+`NetworkError`, что и из `NetworkService` (см. раздел «NetworkService → Обработка
+ошибок»). Шаблон вызова:
+
+```swift
+do {
+    let contacts = try await ContactsService.shared.fetchContacts()
+    // ...
+} catch let error as NetworkError {
+    print(error.errorDescription ?? "Ошибка загрузки контактов")
+}
+```
+
+### Детали реализации, важные для интеграции
+
+- **Синглтон без состояния.** `ContactsService.shared`, `init` приватный. Класс не
+  хранит кэшей и изменяемого состояния — это чистый «фасад» над REST-эндпоинтами,
+  поэтому безопасен для вызова из любого места.
+- **Приватность синхронизации.** `syncContacts` **никогда** не отправляет открытые
+  номера: каждый номер проходит через `sha256(_:)` (SHA-256 из `CryptoKit`,
+  результат — hex-строка в нижнем регистре). Сервер матчит контакты по хешам. Если
+  меняете формат/нормализацию номера — делайте это **до** хеширования и одинаково на
+  клиенте и сервере, иначе хеши не совпадут.
+- **`updateProfile` — частичное обновление.** Все параметры опциональны и по
+  умолчанию `nil`. Передавайте только те поля, которые действительно меняются; поля
+  со значением `nil` кодируются в тело запроса как есть — согласуйте с сервером
+  семантику `null` (сброс поля vs «не трогать»), если это важно.
+- **`block`/`unblock` не возвращают значения.** Внутри используется локальная
+  `OkResponse { ok: Bool }` только чтобы удовлетворить дженерик `NetworkService`
+  (метод всегда декодирует тело в `Decodable`). Наружу методы — `async throws` без
+  результата: успех = отсутствие брошенной ошибки.
+- **Поиск нечувствителен к тому, как фильтрует UI.** `searchUsers` уходит на сервер
+  (`GET /users/search?q=`). Локальная фильтрация уже загруженного списка
+  (по `displayName`/`username`) — задача презентационного слоя (`ContactsViewModel`),
+  а не сервиса.
+
+### Точки расширения
+
+- **Пагинация поиска/контактов.** Сейчас `fetchContacts`/`searchUsers` возвращают
+  плоский список. При росте объёмов сюда логично добавить курсорную пагинацию по
+  аналогии с `ChatService.fetchMessages`.
+- **Аватар профиля.** `updateProfile` меняет текстовые поля; загрузка изображения
+  аватара (upload + `avatarUrl`) — естественное расширение рядом с ним.
+- **Нормализация номеров.** Единая нормализация телефонов (E.164) перед хешированием
+  повысит долю совпадений при `syncContacts` — её уместно встроить в `sha256`-конвейер.
+- **Кэширование.** Модуль намеренно без кэша. Список контактов/блокировок при
+  необходимости офлайн-доступа можно кэшировать внутри сервиса, не меняя публичный API.
